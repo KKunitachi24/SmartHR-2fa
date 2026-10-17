@@ -34,12 +34,37 @@
     <!-- メイン画面（初期は非表示） -->
     <div id="mainContent" class="hidden space-y-4">
       <div class="flex justify-between items-center">
-        <button onclick="syncData()" class="text-xs bg-gray-800 hover:bg-gray-700 px-3 py-1.5 rounded-lg border border-gray-700 text-gray-300">🔄 再同期</button>
+        <button onclick="syncData()" id="syncBtn" class="text-xs bg-gray-800 hover:bg-gray-700 px-3 py-1.5 rounded-lg border border-gray-700 text-gray-300">🔄 再同期</button>
         <button onclick="showAddModal()" class="bg-indigo-600 hover:bg-indigo-500 text-xs font-bold px-3 py-1.5 rounded-lg text-white">＋ 2FA追加</button>
       </div>
       <div id="otpList" class="space-y-3">
-        <!-- 2FAカードがここに動的追加されます -->
+        <!-- 2FAカードがここに自動追加されます -->
       </div>
+    </div>
+  </div>
+
+  <!-- モーダル（2FAキー追加画面） -->
+  <div id="addModal" class="hidden fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center p-4 z-50">
+    <div class="bg-gray-800 p-6 rounded-xl border border-gray-700 max-w-sm w-full space-y-4 shadow-2xl">
+      <h3 class="text-lg font-bold">2FAアカウントの追加</h3>
+      <form onsubmit="handleAddOTP(event)" class="space-y-3">
+        <div>
+          <label class="block text-xs text-gray-400 mb-1">サービス名 (Issuer)</label>
+          <input type="text" id="issuerInput" placeholder="例: GitHub, AWS, SmartHR" required class="w-full bg-gray-900 border border-gray-700 rounded-lg p-2 text-sm text-white focus:outline-none focus:border-indigo-500">
+        </div>
+        <div>
+          <label class="block text-xs text-gray-400 mb-1">アカウント名 / ラベル</label>
+          <input type="text" id="labelInput" placeholder="例: admin@example.com" required class="w-full bg-gray-900 border border-gray-700 rounded-lg p-2 text-sm text-white focus:outline-none focus:border-indigo-500">
+        </div>
+        <div>
+          <label class="block text-xs text-gray-400 mb-1">シークレットキー (Secret Key)</label>
+          <input type="text" id="secretInput" placeholder="例: JBSWY3DPEHPK3PXP" required class="w-full bg-gray-900 border border-gray-700 rounded-lg p-2 text-sm text-white font-mono focus:outline-none focus:border-indigo-500">
+        </div>
+        <div class="flex justify-end gap-2 pt-2">
+          <button type="button" onclick="closeAddModal()" class="px-4 py-2 text-xs text-gray-400 hover:text-white">キャンセル</button>
+          <button type="submit" id="saveBtn" class="bg-indigo-600 hover:bg-indigo-500 text-white font-bold px-4 py-2 rounded-lg text-xs">保存 & 同期</button>
+        </div>
+      </form>
     </div>
   </div>
 
@@ -48,7 +73,7 @@
     let masterPassword = "";
     let vaultData = [];
 
-    // 暗号化/復号用ヘルパー (Web Crypto API)
+    // 暗号化/復号用ヘルパー (Web Crypto API - PBKDF2 + AES-256-GCM)
     async function getKey(password, salt) {
       const enc = new TextEncoder();
       const keyMaterial = await crypto.subtle.importKey("raw", enc.encode(password), "PBKDF2", false, ["deriveKey"]);
@@ -59,6 +84,21 @@
         false,
         ["encrypt", "decrypt"]
       );
+    }
+
+    async function encryptData(data, password) {
+      const salt = crypto.getRandomValues(new Uint8Array(16));
+      const iv = crypto.getRandomValues(new Uint8Array(12));
+      const key = await getKey(password, salt);
+      const encoded = new TextEncoder().encode(JSON.stringify(data));
+      const encrypted = await crypto.subtle.encrypt({ name: "AES-GCM", iv: iv }, key, encoded);
+      
+      const result = new Uint8Array(salt.length + iv.length + encrypted.byteLength);
+      result.set(salt, 0);
+      result.set(iv, salt.length);
+      result.set(new Uint8Array(encrypted), salt.length + iv.length);
+      
+      return btoa(String.fromCharCode(...result));
     }
 
     async function decryptData(ciphertextBase64, password) {
@@ -78,7 +118,7 @@
 
     // ロック解除処理
     async function handleUnlock(event) {
-      event.preventDefault(); // ページの再読み込みを確実に防ぐ
+      event.preventDefault();
       const pwdInput = document.getElementById("masterPasswordInput");
       const btn = document.getElementById("unlockBtn");
       masterPassword = pwdInput.value;
@@ -89,19 +129,9 @@
       btn.innerText = "同期中...";
 
       try {
-        const res = await fetch(GAS_API_URL);
-        const json = await res.json();
-        
-        if (json.ciphertext) {
-          vaultData = await decryptData(json.ciphertext, masterPassword);
-        } else {
-          vaultData = [];
-        }
-
-        // 画面切り替え
+        await syncData();
         document.getElementById("lockScreen").classList.add("hidden");
         document.getElementById("mainContent").classList.remove("hidden");
-        renderOTPs();
       } catch (err) {
         alert("エラー: " + err.message);
       } finally {
@@ -110,10 +140,113 @@
       }
     }
 
+    // ドライブからの最新同期 (GET)
+    async function syncData() {
+      const statusEl = document.getElementById("syncStatus");
+      statusEl.innerText = "同期中...";
+      statusEl.className = "text-xs bg-yellow-900 text-yellow-300 px-3 py-1 rounded-full border border-yellow-700";
+
+      try {
+        const res = await fetch(GAS_API_URL);
+        const json = await res.json();
+        
+        if (json.ciphertext) {
+          vaultData = await decryptData(json.ciphertext, masterPassword);
+        } else {
+          vaultData = [];
+        }
+        renderOTPs();
+        statusEl.innerText = "同期完了";
+        statusEl.className = "text-xs bg-green-900 text-green-300 px-3 py-1 rounded-full border border-green-700";
+      } catch (err) {
+        statusEl.innerText = "同期エラー";
+        statusEl.className = "text-xs bg-red-900 text-red-300 px-3 py-1 rounded-full border border-red-700";
+        throw err;
+      }
+    }
+
+    // 保存 & ドライブ書き込み (POST)
+    async function saveVault() {
+      const statusEl = document.getElementById("syncStatus");
+      statusEl.innerText = "保存中...";
+      statusEl.className = "text-xs bg-yellow-900 text-yellow-300 px-3 py-1 rounded-full border border-yellow-700";
+
+      const ciphertext = await encryptData(vaultData, masterPassword);
+      const res = await fetch(GAS_API_URL, {
+        method: "POST",
+        body: JSON.stringify({ ciphertext: ciphertext })
+      });
+      const json = await res.json();
+      if (json.status === "success") {
+        statusEl.innerText = "同期完了";
+        statusEl.className = "text-xs bg-green-900 text-green-300 px-3 py-1 rounded-full border border-green-700";
+      } else {
+        throw new Error(json.message || "保存に失敗しました");
+      }
+    }
+
+    // モーダル操作
+    function showAddModal() {
+      document.getElementById("addModal").classList.remove("hidden");
+    }
+
+    function closeAddModal() {
+      document.getElementById("addModal").classList.add("hidden");
+      document.getElementById("issuerInput").value = "";
+      document.getElementById("labelInput").value = "";
+      document.getElementById("secretInput").value = "";
+    }
+
+    async function handleAddOTP(event) {
+      event.preventDefault();
+      const issuer = document.getElementById("issuerInput").value.trim();
+      const label = document.getElementById("labelInput").value.trim();
+      let secret = document.getElementById("secretInput").value.trim().replace(/\s+/g, '').toUpperCase();
+
+      if (!secret) return;
+
+      // シークレットキー形式テスト
+      try {
+        const testTotp = new OTPAuth.TOTP({ secret: secret });
+        testTotp.generate();
+      } catch(e) {
+        alert("無効なシークレットキー形式です。正しいBase32文字（A-Z, 2-7）を入力してください。");
+        return;
+      }
+
+      const saveBtn = document.getElementById("saveBtn");
+      saveBtn.disabled = true;
+      saveBtn.innerText = "暗号化・保存中...";
+
+      try {
+        vaultData.push({ issuer, label, secret });
+        await saveVault();
+        renderOTPs();
+        closeAddModal();
+      } catch (err) {
+        alert("保存エラー: " + err.message);
+      } finally {
+        saveBtn.disabled = false;
+        saveBtn.innerText = "保存 & 同期";
+      }
+    }
+
+    // 削除機能
+    async function deleteOTP(index) {
+      if (!confirm("この2FAキーを削除してもよろしいですか？")) return;
+      vaultData.splice(index, 1);
+      try {
+        await saveVault();
+        renderOTPs();
+      } catch (err) {
+        alert("削除エラー: " + err.message);
+      }
+    }
+
     function renderOTPs() {
       const listEl = document.getElementById("otpList");
       if (vaultData.length === 0) {
-        listEl.innerHTML = '<div class="text-center text-gray-500 py-8 text-sm">登録されている2FAキーはありません。「＋ 2FA追加」から登録してください。</div>';
+        listEl.innerHTML = '<div class="text-center text-gray-500 py-8 text-sm bg-gray-800 rounded-xl border border-gray-700">登録されている2FAキーはありません。<br>「＋ 2FA追加」から登録してください。</div>';
         return;
       }
       listEl.innerHTML = "";
@@ -122,15 +255,31 @@
           const totp = new OTPAuth.TOTP({ secret: item.secret });
           const code = totp.generate();
           listEl.innerHTML += `
-            <div class="bg-gray-800 p-4 rounded-xl border border-gray-700">
-              <div class="text-xs text-gray-400 font-medium">${item.issuer || '2FA'}</div>
-              <div class="text-lg font-bold tracking-wider">${item.label || ''}</div>
-              <div class="text-2xl font-mono font-bold text-indigo-400 mt-1">${code}</div>
+            <div class="bg-gray-800 p-4 rounded-xl border border-gray-700 flex justify-between items-center shadow-md">
+              <div>
+                <div class="text-xs text-indigo-400 font-semibold mb-0.5">${item.issuer || '2FA'}</div>
+                <div class="text-sm font-bold text-gray-200 mb-1">${item.label || ''}</div>
+                <div class="text-2xl font-mono font-bold text-white tracking-widest">${code}</div>
+              </div>
+              <button onclick="deleteOTP(${idx})" class="text-gray-500 hover:text-red-400 p-2 text-xs transition">🗑️</button>
             </div>
           `;
-        } catch(e) {}
+        } catch(e) {
+          listEl.innerHTML += `
+            <div class="bg-gray-800 p-4 rounded-xl border border-red-900 text-red-400 text-xs">
+              生成エラー: 無効なキー形式 (${item.issuer})
+            </div>
+          `;
+        }
       });
     }
+
+    // コードのリアルタイム更新 (1秒ごとに再生成判定)
+    setInterval(() => {
+      if (vaultData.length > 0) {
+        renderOTPs();
+      }
+    }, 1000);
   </script>
 </body>
 </html>
